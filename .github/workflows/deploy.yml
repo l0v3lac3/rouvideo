@@ -1,0 +1,68 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Frontend is a static SPA; the Convex backend address is baked in at
+    # build time from the repository variable CONVEX_URL
+    # (Settings > Secrets and variables > Variables).
+    env:
+      VITE_CONVEX_URL: ${{ vars.CONVEX_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify Convex URL is configured
+        run: |
+          if [ -z "$VITE_CONVEX_URL" ]; then
+            echo "::error::Repository variable CONVEX_URL is not set (expected the Convex prod deployment URL)."
+            exit 1
+          fi
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify Convex URL baked into bundle
+        run: |
+          if ! grep -q "convex.cloud" dist/assets/*.js; then
+            echo "::error::Built bundle does not contain the Convex deployment URL."
+            exit 1
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
