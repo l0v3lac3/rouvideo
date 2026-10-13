@@ -1,113 +1,152 @@
-# react-convex-app
+# rouvideo
 
-React + Convex 全栈开发项目。
+rou.video 无广告播放器 —— 由原 `rou-proxy-player.py` 单文件脚本重构为
+**React + TypeScript + Vite（前端）/ Convex（后端）** 的应用。
+
+- 前端是纯静态 SPA，部署在 **GitHub Pages**：https://l0v3lac3.github.io/rouvideo/
+- 后端跑在 **Convex**（HTTP actions），承担所有需要服务端能力的工作
+
+## 为什么必须有服务端
+
+原脚本的代理逻辑不是可有可无的，以下三点都是实测结论（不是推测）：
+
+1. **上游要求浏览器 UA**：rou.video 与其视频 CDN 对无 UA / 非浏览器 UA 的请求返回 403。
+   浏览器无法为媒体请求伪造 `User-Agent`，所以必须服务端发请求。
+2. **载荷被 PNG 包裹**：所有媒体响应都是 PNG 容器，真实数据藏在自定义块
+   `roUd`（`0x726f5564`）里，可能还经过 zlib 压缩。不解包得到的字节既不能播放，
+   也无法被 hls.js 解析。
+3. **完全没有 CORS 头**：浏览器无法直接 `fetch` 这些响应。
+
+**不需要** TLS/JA3/JA4 指纹伪装（curl_cffi、impers、cycletls 之类）：Cloudflare 在这几个
+端点上接受普通 `fetch`，实测多种 UA 均可通过。因此本项目不引入任何指纹伪装依赖。
 
 ## 技术栈
 
 | 层 | 技术 | 版本 |
 | --- | --- | --- |
-| 前端框架 | React | 19.3.0 |
-| 语言 | TypeScript | 6.0.3 |
-| 构建/开发服务器 | Vite | 8.x |
-| 后端/数据库 | Convex | 1.46.0 |
+| 前端框架 | React | 19.3 |
+| 语言 | TypeScript | 6.0 |
+| 构建 / 开发服务器 | Vite | 8.3 |
+| 播放器 | hls.js | 1.7（按需动态加载） |
+| 后端 | Convex（HTTP actions + V8 isolate） | 1.46 |
+| 解压缩 | fflate（纯 JS，替代 Node `zlib`） | 0.8 |
+| 检查 / 格式 | oxlint（Vite 模板默认） / Prettier | — |
 | 包管理器 | npm | 10.x |
-| 版本控制 | Git | 2.x |
 
 ## 目录结构
 
 ```
-react-convex-app/
-├── convex/            # Convex 后端：schema、query/mutation/actions、生成的 .d.ts
-├── public/            # 静态资源（构建时原样拷贝到 dist）
-├── src/               # React 前端源码
-│   ├── main.tsx       # 入口（createRoot + ConvexReactClient 挂载点）
-│   └── App.tsx
-├── index.html         # Vite 入口 HTML
-├── vite.config.ts     # Vite 配置（React 插件，base './' 适配 GitHub Pages）
-├── .github/workflows/ # GitHub Pages 部署 workflow
-├── tsconfig*.json     # TypeScript 配置（app/node 两个 project）
-├── .oxlintrc.json     # oxlint 配置（Vite 模板默认的快速 lint，lint 工具）
-├── .prettierrc        # Prettier 配置
-└── .env.local         # 本地环境变量（不提交到 Git）
+rouvideo/
+├── convex/                  # 后端（Convex）
+│   ├── http.ts              # 路由：/api/resolve、/api/media、/api/health、/api/selftest
+│   ├── rou.ts               # 核心：PNG 解包、ev 解密、HMAC 签名、播放列表重写、SSRF 防护
+│   ├── schema.ts            # 数据模型（当前为空）
+│   └── _generated/          # Convex 自动生成（勿手改）
+├── src/
+│   ├── App.tsx              # 页面外壳：URL 输入 + 说明
+│   ├── components/Player.tsx# HLS 播放器（hls.js 挂载、错误恢复、原生 HLS 回退）
+│   ├── lib/api.ts           # 后端 API 客户端
+│   ├── index.css            # 样式
+│   └── main.tsx             # 入口
+├── public/favicon.svg
+├── .github/workflows/deploy.yml  # GitHub Pages 部署
+├── .env.example             # 环境变量清单
+└── index.html
 ```
 
-## 依赖安装
+## 后端接口
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /api/resolve?url=<视频页>` | 抓取页面 → 正则提取 `ev:{d,k}` → base64 + 逐字节减 k → JSON → 返回 `videoUrl`、**已签名的** `playlistUrl`、`thumbVttUrl`。仅允许 rou.video 域。 |
+| `GET /api/media?u=<b64url>&s=<hmac>` | 抓取目标 → PNG 解包 → 是播放列表则把其中所有 URI 重写为带签名的本接口地址后返回；是分片则直接回传。 |
+| `GET /api/health` | 存活探测。 |
+| `GET /api/selftest` | 运行时能力自检（fflate / Web Crypto / 密钥是否配置），不回显密钥。 |
+
+设计要点：
+
+- **签名防滥用**：`/api/media` 的 URL 经 HMAC-SHA256 签名（密钥为 Convex 环境变量
+  `ROU_PROXY_SECRET`），因此本部署不会变成公开代理。未配置密钥时退化为域名白名单。
+- **绝对地址**：重写出的分片地址使用后端自身 origin（取 `req.url`）。因为前端在
+  GitHub Pages、后端在 Convex，**绝对不能用根相对路径**——否则浏览器会把
+  `/api/media` 解析到页面所在域。
+- **SSRF 防护**：仅允许 https，拒绝 localhost / 私有网段 / link-local（如云元数据地址）。
+- 播放列表重写同时覆盖裸 URI 行与 `URI="..."` 属性（`EXT-X-KEY`、`EXT-X-MAP`、
+  `EXT-X-MEDIA`、`EXT-X-I-FRAME-STREAM-INF` 等）。
+- 分片响应带 `Cache-Control: immutable`，避免同一分片反复穿过部署。
+
+## 本地开发
 
 ```bash
 npm install
+npx convex dev          # 终端 1：后端，热同步 convex/ 到 dev 部署
+npm run dev             # 终端 2：前端（默认 http://localhost:5173）
 ```
 
-## 前端启动
+`npx convex dev` 首次运行会要求浏览器 OAuth 登录并创建 dev 部署，随后把
+`VITE_CONVEX_URL`、`VITE_CONVEX_SITE_URL`、`CONVEX_DEPLOYMENT` 写进 `.env.local`。
+注意 1.46.x 的 dev 部署跑在**云端**，本机没有 3847 端口进程。
+
+首次部署后端后需要配置签名密钥（值不要提交到仓库）：
 
 ```bash
-npm run dev
+npx convex env set ROU_PROXY_SECRET "$(openssl rand -hex 32)"
 ```
 
-默认访问 http://localhost:5173。
-
-## Convex 开发环境
+## 检查与构建
 
 ```bash
-npx convex dev
+npm run lint           # oxlint
+npm run format         # Prettier 格式化
+npm run format:check   # 只检查格式
+npm run build          # tsc -b && vite build（产物在 dist/）
 ```
 
-- 首次运行要求登录 Convex 账户（浏览器 OAuth），并选择项目名/区域来创建 dev 部署。
-- 当前 CLI（1.46.x）的 dev 部署运行在 Convex 云端（本项目：
-  `https://opulent-chickadee-561.convex.cloud`），代码改动由 `convex dev`
-  自动热同步推送；没有 localhost:3847 本地进程。
-- 登录与部署凭证由 CLI 写入 `.env.local`（`VITE_CONVEX_URL`、
-  `CONVEX_DEPLOYMENT`、`VITE_CONVEX_SITE_URL`）。
-- 发布到生产需要显式 `npx convex deploy --prod`（本项目尚未创建 prod 部署）。
-
-## 代码检查和格式化
-
-```bash
-npm run lint           # oxlint（Vite 模板默认 lint 工具）
-npm run format         # Prettier 格式化 src/
-npm run format:check   # Prettier 只检查不修改
-npm run build          # tsc -b && vite build
-```
-
-职责划分：TypeScript 负责类型检查，oxlint 负责代码规范与潜在错误，Prettier 只负责格式。
+分工：TypeScript 管类型，oxlint 管规范与潜在错误，Prettier 只管格式。
 
 ## 环境变量
 
-- 本地配置写在 `.env.local`（已被 `.gitignore` 排除，**不要提交**）。
-- 本地开发用的变量（CLI 写入）：`VITE_CONVEX_URL`、`CONVEX_DEPLOYMENT`、
-  `VITE_CONVEX_SITE_URL`。
-- CI 构建用的变量（GitHub 仓库变量，非 secret）：
-  - `CONVEX_URL` — 线上前端要连接的 Convex 部署地址（建议为 prod 部署 URL），
-    在仓库 Settings → Secrets and variables → Variables 中配置，
-    workflow 构建时通过 `VITE_CONVEX_URL` 注入产物。
-- 不要把 API 密钥、访问令牌写入源代码或提交到 Git。
+`.env.local`（本地，已被 gitignore）：
 
-## 部署到 GitHub Pages
+| 变量 | 说明 |
+| --- | --- |
+| `VITE_CONVEX_SITE_URL` | HTTP actions 地址 `https://<deployment>.convex.site`，前端调用后端用的就是它 |
+| `VITE_CONVEX_URL` | 客户端地址 `https://<deployment>.convex.cloud`（当前未使用，留给将来的 query/mutation） |
+| `CONVEX_DEPLOYMENT` | CLI 用来定位部署，由 `npx convex dev` 写入 |
 
-工作流：`.github/workflows/deploy.yml`
+Convex 环境变量（服务端，不在仓库里）：`ROU_PROXY_SECRET`。
 
-```
-push main → npm ci → npm run lint → npm run build → 校验 bundle 含 convex.cloud
-          → 上传 dist → actions/deploy-pages 发布
-```
+## 部署
 
-一次性准备：
+前端（GitHub Pages）由 `.github/workflows/deploy.yml` 完成：
+`npm ci → 校验变量 → lint → build → 校验产物内含 convex.site → 上传 → 发布`。
 
-1. 仓库 Settings → Pages → Source 选 **GitHub Actions**。
-2. 仓库 Settings → Secrets and variables → Variables 添加
-   `CONVEX_URL`（值如 `https://<prod>.convex.cloud`）。
-3. `git push` 到 `main` 后，在 Actions 标签页查看构建/部署状态；
-   部署完成后访问 `https://l0v3lac3.github.io/rouvideo/`。
+仓库变量（Settings → Secrets and variables → **Actions** → Variables）：
 
-注意：前端产物在**构建时**固化后端地址；更换 Convex 部署后需重新触发构建。
+| 变量 | 必需 | 值 |
+| --- | --- | --- |
+| `CONVEX_SITE_URL` | 是 | `https://<deployment>.convex.site` |
+| `CONVEX_URL` | 否 | `https://<deployment>.convex.cloud`（仅供将来的客户端 SDK 使用） |
 
-## 当前尚未完成的事项
+注意：后端地址在**构建时**固化进产物，更换 Convex 部署后需重新触发构建。
 
-- `convex/schema.js` 尚无业务数据表（schema 为空，示例已注释）。
-- `src/App.tsx` 尚未调用 Convex 后端函数（Provider 已接入，未使用 query/mutation）。
-- `/hello` HTTP 路由已注册并推送成功，但经 Cloudflare 边缘实测返回 404
-  （疑为 dev 部署边缘路由传播延迟或 region 差异；待部署稳定后复测）。
-- 未创建生产（prod）部署，`npx convex deploy --prod` 需用户确认后执行；
-  之后需在仓库变量 `CONVEX_URL` 中配置该部署地址。
-- GitHub Pages 的一次性准备（仓库 Pages 源设为 GitHub Actions、
-  添加仓库变量 `CONVEX_URL`）需在 GitHub 界面完成。
-- 尚未进行首次 `git commit`（等待代码审查）。
+后端发布到生产需显式执行 `npx convex deploy --prod`（当前只有 dev 部署，前端指向它）。
+
+## 与原脚本的对应关系
+
+| 原 Python | 现在 |
+| --- | --- |
+| `unwrap_png()` / `decrypt_ev()` | `convex/rou.ts`（同样的 `roUd` 块、同样的 zlib 与逐字节减 k 算法） |
+| `/api/resolve` | `convex/http.ts` 的 `/api/resolve`（额外做了域名白名单与签名） |
+| `/proxy/<url>` | `/api/media?u=&s=`（额外做了签名、SSRF 防护、绝对地址、缓存头） |
+| 内嵌 `PLAYER_HTML` 字符串 | `src/components/Player.tsx` + `src/App.tsx`（React 组件） |
+| 本地 `hls.js` 文件 / CDN 拉取 | npm 依赖 `hls.js`，按需动态加载 |
+| 硬编码的 Cookie 常量 | 已删除——实测上游并不需要 Cookie，只需 UA |
+
+## 已知限制
+
+- **带宽**：媒体字节会穿过 Convex。HTTP action 响应上限 100 MiB（远大于分片），
+  但免费档并发 HTTP action 为 64，且需留意用量配额。
+- **播放列表无 `#EXT-X-ENDLIST`**：hls.js 会按点播处理（实测缓冲正常），
+  但上游格式若有变化需重新验证。
+- 未创建生产部署；未接入数据库功能（`schema.ts` 为空）。

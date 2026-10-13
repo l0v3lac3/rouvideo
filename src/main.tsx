@@ -1,16 +1,13 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ConvexProvider, ConvexReactClient } from 'convex/react';
 import './index.css';
 import App from './App.tsx';
 
-// Convex client: reads VITE_CONVEX_URL from .env.local (written by the Convex CLI).
-const convex = new ConvexReactClient(import.meta.env.VITE_CONVEX_URL);
-
+// This app talks to Convex through its HTTP actions API (see convex/http.ts and
+// src/lib/api.ts), so no ConvexReactClient/ConvexProvider is needed. Add one here
+// if you later introduce queries or mutations.
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <ConvexProvider client={convex}>
-      <App />
-    </ConvexProvider>
+    <App />
   </StrictMode>,
 );

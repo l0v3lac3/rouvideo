@@ -17,10 +17,14 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Frontend is a static SPA; the Convex backend address is baked in at
-    # build time from the repository variable CONVEX_URL
-    # (Settings > Secrets and variables > Variables).
+    # The frontend is a static SPA; it reaches the Convex backend over HTTP, so the
+    # deployment addresses must be baked in at build time. Configure them as
+    # repository variables (Settings > Secrets and variables > Actions > Variables):
+    #   CONVEX_SITE_URL  (required)  – HTTP actions URL, https://<deployment>.convex.site
+    #   CONVEX_URL       (optional)  – client URL, https://<deployment>.convex.cloud
+    #                                  (only needed if you add queries/mutations)
     env:
+      VITE_CONVEX_SITE_URL: ${{ vars.CONVEX_SITE_URL }}
       VITE_CONVEX_URL: ${{ vars.CONVEX_URL }}
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +37,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Verify Convex URL is configured
+      - name: Verify backend URL is configured
         run: |
-          if [ -z "$VITE_CONVEX_URL" ]; then
-            echo "::error::Repository variable CONVEX_URL is not set (expected the Convex prod deployment URL)."
+          if [ -z "$VITE_CONVEX_SITE_URL" ]; then
+            echo "::error::Repository variable CONVEX_SITE_URL is not set (expected https://<deployment>.convex.site)."
             exit 1
           fi
+          case "$VITE_CONVEX_SITE_URL" in
+            https://*.convex.site) ;;
+            *) echo "::error::CONVEX_SITE_URL must look like https://<deployment>.convex.site"; exit 1 ;;
+          esac
 
       - name: Lint
         run: npm run lint
@@ -46,10 +54,10 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Verify Convex URL baked into bundle
+      - name: Verify backend URL baked into bundle
         run: |
-          if ! grep -q "convex.cloud" dist/assets/*.js; then
-            echo "::error::Built bundle does not contain the Convex deployment URL."
+          if ! grep -rq "convex.site" dist/assets/; then
+            echo "::error::Built bundle does not contain the Convex site URL."
             exit 1
           fi
 
