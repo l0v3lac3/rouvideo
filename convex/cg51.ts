@@ -24,7 +24,7 @@
  *    with a *fresh* auth_key on every page render, so the article is re-fetched
  *    server-side each time it is opened.
  */
-import { HttpError } from "./rou";
+import { HttpError, b64urlEncode, sign } from "./rou";
 
 export const CG51_LANDING = "https://cg51.com";
 export const DEFAULT_NODE = "https://51qingliang.com";
@@ -275,6 +275,12 @@ export function parseFeed(html: string, node: string, path: string, page: number
     const title = block.match(/itemprop="headline">\s*([^<]+?)\s*</);
     const cover = block.match(/loadBannerDirect\('([^']+)'/) ?? block.match(/data-xkrkllgl="([^"]+)"/);
     const pub = block.match(/itemprop="datePublished" content="([^"]+)"/);
+    // Station promo/ad cards (Meme coin, 招募, 抽奖, 福利) omit the whole
+    // post-card-info meta row (no author / date / category span). Legit
+    // articles always carry datePublished. Skip the promo cards entirely —
+    // verified: every no-date card on the home feed + 往期活动 category was a
+    // station ad, and 43/43 normal articles have datePublished.
+    if (!pub) continue;
     // Author: 51qingliang puts it inline ("瓜瓜 • "), 51cg1 in a display-none meta.
     const author =
       block.match(/itemprop="author"[^>]*>\s*([^<]+?)\s*•/) ??
@@ -328,6 +334,13 @@ export type Cg51Video = {
   id: string;
 };
 
+export type Cg51BodyBlock =
+  | { type: "p"; text: string }
+  | { type: "h"; level: number; text: string }
+  | { type: "img"; url: string }
+  | { type: "video"; video: Cg51Video }
+  | { type: "quote"; text: string };
+
 export type Cg51Article = {
   node: string;
   url: string;
@@ -340,7 +353,11 @@ export type Cg51Article = {
   tags: string[];
   cover: string;
   images: string[];
+  /** Ordered body as it appears on the original site (text/heading/image/video). */
+  body: Cg51BodyBlock[];
   video: Cg51Video | null;
+  /** True when this is a station promo/ad article (no playable video). */
+  isPromo: boolean;
 };
 
 /**
@@ -368,7 +385,103 @@ function extractDplayerConfig(attrs: string): Record<string, unknown> | null {
   return null;
 }
 
-/** Parse an /archives/<id>/ page into full metadata + media list. */
+/** Decode common HTML entities (numeric + named). */
+function decodeEntities(s: string): string {
+  const NAMED: Record<string, string> = {
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  };
+  return s
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16)))
+    .replace(/&([a-z]+);/gi, (m, name) => NAMED[name.toLowerCase()] ?? m);
+}
+
+/** Strip all tags from an HTML fragment and collapse whitespace. */
+function stripTags(html: string): string {
+  const text = html.replace(/<[^>]+>/g, " ");
+  return decodeEntities(text).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Extract the inner HTML of `<div class="post-content" itemprop="articleBody">`
+ * (the real ordered body). Returns "" if the page has no such block.
+ */
+function extractArticleBody(html: string): string {
+  const startTag = '<div class="post-content" itemprop="articleBody">';
+  const start = html.indexOf(startTag);
+  if (start < 0) return "";
+  let pos = html.indexOf(">", start) + 1; // just inside the opening tag
+  let depth = 1;
+  while (pos < html.length) {
+    const nextOpen = html.indexOf("<div", pos);
+    const nextClose = html.indexOf("</div>", pos);
+    if (nextClose === -1) break;
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      depth++;
+      pos = nextOpen + 4;
+    } else {
+      depth--;
+      pos = nextClose + 6;
+      if (depth === 0) break;
+    }
+  }
+  return html.slice(html.indexOf(">", start) + 1, pos);
+}
+
+/**
+ * Build a Cg51Video from a dplayer tag's attribute string (empty attrs → null).
+ * Used both for the top-level player and for in-body video blocks.
+ */
+function extractVideoFromDplayer(attrs: string): Cg51Video | null {
+  const cfg = extractDplayerConfig(attrs);
+  if (!cfg) return null;
+  const vid = attrs.match(/data-video_id="(\d+)"/)?.[1] ?? "";
+  const v = cfg["video"] as { url?: string; type?: string } | undefined;
+  if (v?.url) return { url: v.url, type: v.type ?? "hls", id: vid };
+  const h265 = (cfg["video_h265"] as Array<{ url?: string; type?: string }>) ?? [];
+  const alt = h265.find(h => h?.url);
+  return alt?.url ? { url: alt.url, type: alt.type ?? "mp4", id: vid } : null;
+}
+
+/**
+ * Parse the ordered articleBody HTML into blocks in original site order:
+ * paragraphs, headings, images, in-body videos and quote boxes. The station
+ * gambling `txt-apps` row, `line` dividers and `menu_index` anchors are dropped
+ * as they are site chrome/ads, not article content.
+ */
+export function parseArticleBody(bodyHtml: string): Cg51BodyBlock[] {
+  const blocks: Cg51BodyBlock[] = [];
+  const BLOCK_RE =
+    /<h([23])[^>]*>([\s\S]*?)<\/h[23]>|<blockquote[\s\S]*?<\/blockquote>|<p[^>]*>([\s\S]*?)<\/p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = BLOCK_RE.exec(bodyHtml))) {
+    if (m[1]) {
+      const text = stripTags(m[2]);
+      if (text) blocks.push({ type: "h", level: Number(m[1]), text });
+    } else if (m[0].startsWith("<blockquote")) {
+      const text = stripTags(m[0]);
+      if (text) blocks.push({ type: "quote", text });
+    } else if (m[3] !== undefined) {
+      const inner = m[3];
+      const vidMatch = inner.match(/class="dplayer"([^>]*)/);
+      const video = vidMatch ? extractVideoFromDplayer(vidMatch[1]) : null;
+      if (video) {
+        blocks.push({ type: "video", video });
+        continue;
+      }
+      const text = stripTags(inner);
+      const imgSrc = inner.match(/data-xkrkllgl="([^"]+)"/)?.[1] ??
+        inner.match(/<img[^>]+src="(https:[^"]+)"/)?.[1];
+      // Push text and image separately (both, in order) so a mixed paragraph
+      // is preserved; image-only paragraphs yield just an img block.
+      if (text) blocks.push({ type: "p", text });
+      if (imgSrc) blocks.push({ type: "img", url: imgSrc });
+    }
+  }
+  return blocks;
+}
+
+/** Parse an /archives/<id>/ page into full metadata + ordered body + media. */
 export function parseArticle(html: string, node: string, path: string): Cg51Article {
   const base = node.replace(/\/+$/, "");
   const url = `${base}${path}`;
@@ -381,7 +494,7 @@ export function parseArticle(html: string, node: string, path: string): Cg51Arti
   title = title.replace(/\s*[-|]\s*51吃瓜(轻量版|网).*$/, "").trim();
 
   const og = html.match(/property="og:description" content="([^"]*)"/);
-  const desc = og ? og[1] : "";
+  const desc = og ? decodeEntities(og[1]) : "";
 
   // Author: schema.org Person, falling back to the display-none author meta
   // (the two node skins emit different shapes).
@@ -405,28 +518,26 @@ export function parseArticle(html: string, node: string, path: string): Cg51Arti
       ? [sectionsStr[1]]
       : [];
 
+  // Ordered body (original site layout) + in-body videos.
+  const bodyHtml = extractArticleBody(html);
+  const body = parseArticleBody(bodyHtml);
+
+  // The top-level player is the first dplayer anywhere on the page (the site
+  // may also embed a preview player outside the body).
   const dplayerTag = html.match(/class="dplayer"([^>]*)/)?.[1] ?? "";
+  const video = extractVideoFromDplayer(dplayerTag);
   const tagsFromVideo = dplayerTag.match(/data-video_tag_name="([^"]*)"/);
   const metaKeywords = html.match(/name="keywords" content="([^"]*)"/);
   const tagSource = tagsFromVideo?.[1] ?? metaKeywords?.[1] ?? "";
   const tags = tagSource.split(",").map(t => t.trim()).filter(Boolean);
 
-  const images = [...html.matchAll(/data-xkrkllgl="(https:\/\/[^"]+)"/g)].map(m => m[1]);
+  // Flat image list = every image block, in order (kept for the gallery).
+  const images = body.filter(b => b.type === "img").map(b => (b as { url: string }).url);
   const cover = images[0] ?? "";
 
-  let video: Cg51Video | null = null;
-  const cfg = extractDplayerConfig(dplayerTag);
-  if (cfg) {
-    const vid = dplayerTag.match(/data-video_id="(\d+)"/)?.[1] ?? "";
-    const v = cfg["video"] as { url?: string; type?: string } | undefined;
-    if (v?.url) {
-      video = { url: v.url, type: v.type ?? "hls", id: vid };
-    } else {
-      const h265 = (cfg["video_h265"] as Array<{ url?: string; type?: string }>) ?? [];
-      const alt = h265.find(h => h?.url);
-      if (alt?.url) video = { url: alt.url, type: alt.type ?? "mp4", id: vid };
-    }
-  }
+  // A legit article always embeds a playable video; station promo posts
+  // (Meme coin, 招募, 抽奖) never do. Verified across 47 articles, 2026-10-14.
+  const isPromo = video === null;
 
   return {
     node: base,
@@ -440,8 +551,70 @@ export function parseArticle(html: string, node: string, path: string): Cg51Arti
     tags,
     cover,
     images,
+    body,
     video,
+    isPromo,
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * Image proxy — the 51吃瓜 image CDNs serve *encrypted* bytes. The site's own
+ * zzz.js fetches each image then runs `decryptImage()` (CryptoJS AES-CBC) to
+ * recover a base64 data-URI. We replicate that: fetch the raw (encrypted)
+ * bytes, AES-128-CBC-decrypt them, and stream the real image back.
+ *
+ * Key/IV (decoded from zzz.js string-rotation, verified 2026-10-14):
+ *   key "f5d965df75336270", iv "97b60394abc2fbe1"  (UTF-8, 16 bytes each)
+ * Images on these hosts are encrypted; the bytes are NOT a valid image until
+ * decrypted (raw magic 0x3eaa708e, real magic 0xffd8ffe0 = JPEG after).
+ * ------------------------------------------------------------------ */
+
+export const CG51_IMG_KEY = "f5d965df75336270";
+export const CG51_IMG_IV = "97b60394abc2fbe1";
+
+/** Hosts confirmed to serve encrypted images (allowlist for /api/img). */
+const IMG_HOSTS = new Set([
+  "pic.gyezbp.cn",
+  "pic.jtzatly.cn",
+  "pic.bxh666.cn",
+]);
+
+export function isCg51ImageHost(host: string): boolean {
+  return IMG_HOSTS.has(host);
+}
+
+/**
+ * AES-128-CBC decrypt raw bytes (PKCS7). The 51吃瓜 image CDN delivers the
+ * ciphertext directly (no base64 wrapper).
+ */
+export async function decryptCg51Image(data: Uint8Array<ArrayBuffer>): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(CG51_IMG_KEY),
+    { name: "AES-CBC" },
+    false,
+    ["decrypt"],
+  );
+  const iv = new TextEncoder().encode(CG51_IMG_IV);
+  return new Uint8Array(
+    await crypto.subtle.decrypt({ name: "AES-CBC", iv }, key, data),
+  );
+}
+
+/**
+ * Build the signed /api/img URL that will decrypt-and-stream `target`.
+ * Mirrors rou.ts `mediaPath`: absolute, on this deployment's own origin.
+ */
+export async function imgPath(
+  secret: string | undefined,
+  origin: string,
+  target: string,
+): Promise<string> {
+  const encoded = b64urlEncode(target);
+  const query = secret
+    ? `u=${encoded}&s=${await sign(secret, target)}`
+    : `u=${encoded}`;
+  return `${origin.replace(/\/+$/, "")}/api/img?${query}`;
 }
 
 /** Fetch a path on the current content node with a browser UA. */

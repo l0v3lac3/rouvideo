@@ -119,6 +119,13 @@ export type FeedResult = {
   items: FeedItem[];
 };
 
+export type Cg51BodyBlock =
+  | { type: 'p'; text: string }
+  | { type: 'h'; level: number; text: string }
+  | { type: 'img'; url: string }
+  | { type: 'video'; video: Cg51Video }
+  | { type: 'quote'; text: string };
+
 export type Cg51Article = {
   node: string;
   url: string;
@@ -131,7 +138,11 @@ export type Cg51Article = {
   tags: string[];
   cover: string;
   images: string[];
+  /** Ordered body in original site layout (text/heading/image/video/quote). */
+  body: Cg51BodyBlock[];
   video: Cg51Video | null;
+  /** Station promo/ad article (Meme/招募/抽奖) — no playable video. */
+  isPromo: boolean;
 };
 
 async function getJson<T>(path: string): Promise<T> {

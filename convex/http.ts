@@ -4,6 +4,10 @@
 //   GET /api/selftest  – runtime capability report (no secrets echoed)
 //   GET /api/resolve   – ?url=<rou.video page> -> stream info + signed playlist path
 //   GET /api/media     – ?u=<base64url target>&s=<hmac> -> unwrapped playlist / segment
+//   GET /api/node      – discover the current 51吃瓜 content node + category nav
+//   GET /api/feed      – ?path=&page=&node= -> list of feed items (covers signed)
+//   GET /api/article   – ?path=/archives/<id>/ -> metadata + gallery + video (signed)
+//   GET /api/img       – ?u=<base64url image>&s=<hmac> -> AES-decrypted image bytes
 //
 // Docs: https://docs.convex.dev/functions/http-actions
 import { httpRouter } from "convex/server";
@@ -12,8 +16,10 @@ import type { ActionCtx } from "./_generated/server";
 import {
   HttpError,
   ROU_ORIGIN,
+  UA,
   assertResolvable,
   assertSafeTarget,
+  b64urlDecode,
   contentTypeFor,
   extractStreamInfo,
   fetchRou,
@@ -25,18 +31,22 @@ import {
   sign,
   timingSafeEqual,
   unwrapPng,
-  b64urlDecode,
 } from "./rou";
 import {
   assertArchivePath,
   buildFeedPath,
+  decryptCg51Image,
   fetchNodeText,
   getNodeForRequest,
+  imgPath,
+  isCg51ImageHost,
   parseArticle,
   parseCategories,
   parseFeed,
   refreshNode,
   CG51_LANDING,
+  type Cg51Article,
+  type FeedResult,
 } from "./cg51";
 import { unzlibSync, zlibSync } from "fflate";
 
@@ -240,6 +250,57 @@ http.route({
   }),
 });
 
+// Sign an encrypted-image URL through /api/img (no-op for non-CDN URLs).
+async function signImgUrl(
+  secret: string | undefined,
+  origin: string,
+  img: string,
+): Promise<string> {
+  if (!img) return img;
+  let host: string;
+  try {
+    host = new URL(img).hostname;
+  } catch {
+    return img;
+  }
+  if (!isCg51ImageHost(host)) return img;
+  return imgPath(secret, origin, img);
+}
+
+// Route every cover in a feed through the image proxy.
+async function signFeed(
+  feed: FeedResult,
+  secret: string | undefined,
+  origin: string,
+): Promise<FeedResult> {
+  const items = [];
+  for (const item of feed.items) {
+    items.push({ ...item, cover: await signImgUrl(secret, origin, item.cover) });
+  }
+  return { ...feed, items };
+}
+
+// Route every image in an article (gallery + cover + in-body images)
+// through the proxy.
+async function signArticleImages(
+  article: Cg51Article,
+  req: Request,
+): Promise<Cg51Article> {
+  const secret = proxySecret();
+  const origin = new URL(req.url).origin;
+  const cover = await signImgUrl(secret, origin, article.cover);
+  const images = [];
+  for (const u of article.images) {
+    images.push(await signImgUrl(secret, origin, u));
+  }
+  const body = [];
+  for (const b of article.body) {
+    if (b.type === "img") body.push({ ...b, url: await signImgUrl(secret, origin, b.url) });
+    else body.push(b);
+  }
+  return { ...article, cover, images, body };
+}
+
 // List feed items for the home page or a category page.
 // ?path=/ (or /category/<slug>)  ?page=N  ?node=<override>
 http.route({
@@ -254,7 +315,8 @@ http.route({
       const base = await getNodeForRequest(nodeOverride);
       const feedPath = buildFeedPath(pathRaw, page);
       const html = await fetchNodeText(feedPath, base);
-      return json(parseFeed(html, base, feedPath, page));
+      const feed = parseFeed(html, base, feedPath, page);
+      return json(await signFeed(feed, proxySecret(), new URL(req.url).origin));
     } catch (error) {
       return fail(error);
     }
@@ -272,11 +334,106 @@ http.route({
       const path = assertArchivePath(params.get("path") || "");
       const base = await getNodeForRequest(params.get("node") || undefined);
       const html = await fetchNodeText(path, base);
-      return json(parseArticle(html, base, path));
+      const article = parseArticle(html, base, path);
+      return json(await signArticleImages(article, req));
     } catch (error) {
       return fail(error);
     }
   }),
 });
+
+/**
+ * Decrypt-and-stream an encrypted 51吃瓜 image.
+ * ?u=<base64url target>&s=<hmac> — same signing scheme as /api/media.
+ * The image CDN serves AES-128-CBC ciphertext; we return the real image bytes.
+ */
+http.route({
+  path: "/api/img",
+  method: "GET",
+  handler: httpAction(async (_ctx: ActionCtx, req: Request) => {
+    try {
+      const params = new URL(req.url).searchParams;
+      const encoded = params.get("u");
+      if (!encoded) throw new HttpError(400, "missing u parameter");
+      const target = b64urlDecode(encoded);
+      const url = assertSafeTarget(target);
+      if (!isCg51ImageHost(url.hostname)) {
+        throw new HttpError(403, "host not an image CDN");
+      }
+      const secret = proxySecret();
+      if (secret) {
+        const provided = params.get("s") ?? "";
+        if (!timingSafeEqual(provided, await sign(secret, target))) {
+          throw new HttpError(403, "bad signature");
+        }
+      }
+
+      const res = await fetch(target, {
+        headers: { "User-Agent": UA, Accept: "*/*" },
+        redirect: "follow",
+      });
+      if (!res.ok) throw new HttpError(502, `upstream returned ${res.status}`);
+      const raw = new Uint8Array(await res.arrayBuffer());
+      let payload: Uint8Array;
+      try {
+        payload = await decryptCg51Image(raw);
+      } catch {
+        // Not encrypted (or key rotated) — pass the raw bytes through so at
+        // least the browser gets something renderable.
+        payload = raw;
+      }
+      return new Response(payload.slice().buffer, {
+        status: 200,
+        headers: {
+          ...CORS,
+          "Content-Type": imageContentType(payload),
+          // Images are immutable; let the browser cache them aggressively.
+          "Cache-Control": "public, max-age=31536000, immutable",
+        },
+      });
+    } catch (error) {
+      return fail(error);
+    }
+  }),
+});
+
+/** Sniff an image Content-Type from magic bytes (fallback: octet-stream). */
+function imageContentType(data: Uint8Array): string {
+  if (
+    data.length > 2 &&
+    data[0] === 0xff &&
+    data[1] === 0xd8 &&
+    data[2] === 0xff
+  ) {
+    return "image/jpeg";
+  }
+  if (
+    data.length > 8 &&
+    data[0] === 0x89 &&
+    data[1] === 0x50 &&
+    data[2] === 0x4e &&
+    data[3] === 0x47
+  ) {
+    return "image/png";
+  }
+  if (
+    data.length > 3 &&
+    data[0] === 0x47 &&
+    data[1] === 0x49 &&
+    data[2] === 0x46
+  ) {
+    return "image/gif";
+  }
+  if (
+    data.length > 5 &&
+    data[0] === 0x52 &&
+    data[1] === 0x57 &&
+    data[2] === 0x56 &&
+    data[3] === 0x55
+  ) {
+    return "image/webp";
+  }
+  return "application/octet-stream";
+}
 
 export default http;

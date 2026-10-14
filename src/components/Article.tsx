@@ -1,23 +1,74 @@
 import { useEffect, useState } from 'react';
 import { Player, type StreamSource } from './Player';
-import { getArticle, type Cg51Article } from '../lib/api';
+import { getArticle, type Cg51Article, type Cg51BodyBlock } from '../lib/api';
 
 /**
- * Article detail: full metadata, tags, image gallery and the video player.
- * The video source is derived from the parsed article:
+ * Article detail in the original site's layout: metadata up top, then the
+ * ordered body (paragraphs, headings, images and videos interleaved exactly
+ * as on 51吃瓜). Station promo posts (isPromo) render their text but no
+ * player.
+ *
+ * The video source for a `video` block is derived from the parsed article:
  *  - `video.type === 'hls'` → hls.js against the m3u8 directly
  *  - otherwise → progressive `video.src`
  */
+function videoSource(v: Cg51Article['video']): StreamSource | null {
+  return v
+    ? {
+        kind: 'url',
+        url: v.url,
+        type: v.type === 'hls' ? 'hls' : 'mp4',
+      }
+    : null;
+}
+
+function BodyBlockView({
+  block,
+  index,
+  node,
+  path,
+}: {
+  block: Cg51BodyBlock;
+  index: number;
+  node: string;
+  path: string;
+}) {
+  switch (block.type) {
+    case 'h': {
+      const Tag = (block.level >= 3 ? 'h3' : 'h2') as 'h2' | 'h3';
+      return <Tag className="article-heading">{block.text}</Tag>;
+    }
+    case 'img':
+      return (
+        <figure className="article-figure">
+          <img src={block.url} alt="" loading="lazy" />
+        </figure>
+      );
+    case 'quote':
+      return <blockquote className="article-quote">{block.text}</blockquote>;
+    case 'video': {
+      const source = videoSource(block.video);
+      if (!source) return null;
+      return (
+        <Player
+          key={`${node}${path}#${index}${block.video.id || block.video.url}`}
+          source={source}
+        />
+      );
+    }
+    case 'p':
+      return <p className="article-p">{block.text}</p>;
+  }
+}
+
 export function Article({ path, node }: { path: string; node: string }) {
   const [article, setArticle] = useState<Cg51Article | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [activeImage, setActiveImage] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     setArticle(null);
     setError(null);
-    setActiveImage(0);
     getArticle(path, node)
       .then((res) => {
         if (!cancelled) setArticle(res);
@@ -31,13 +82,8 @@ export function Article({ path, node }: { path: string; node: string }) {
     };
   }, [path, node]);
 
-  const source: StreamSource | null = article?.video
-    ? {
-        kind: 'url',
-        url: article.video.url,
-        type: article.video.type === 'hls' ? 'hls' : 'mp4',
-      }
-    : null;
+  // Fallback for the legacy shape (no ordered body): old description+gallery.
+  const hasBody = !!article?.body.length;
 
   return (
     <section className="article">
@@ -47,6 +93,9 @@ export function Article({ path, node }: { path: string; node: string }) {
         <>
           <header className="article-header">
             <h1 className="article-title">{article.title}</h1>
+            {article.isPromo ? (
+              <span className="promo-badge">站点活动 / 广告</span>
+            ) : null}
             <dl className="article-meta">
               {article.author ? (
                 <>
@@ -79,36 +128,44 @@ export function Article({ path, node }: { path: string; node: string }) {
                 </>
               ) : null}
             </dl>
-            {article.description ? (
-              <p className="article-desc">{article.description}</p>
-            ) : null}
           </header>
 
-          {source ? (
-            <Player key={`${article.node}${path}`} source={source} />
-          ) : (
-            <p className="status">该文章没有可解析的视频。</p>
-          )}
-
-          {article.images.length ? (
-            <div className="gallery">
-              <div className="gallery-main">
-                <img src={article.images[activeImage]} alt={article.title} />
-              </div>
-              <div className="gallery-thumbs">
-                {article.images.map((img, i) => (
-                  <button
-                    key={i}
-                    className={i === activeImage ? 'thumb active' : 'thumb'}
-                    onClick={() => setActiveImage(i)}
-                    aria-label={`查看图片 ${i + 1}`}
-                  >
-                    <img src={img} alt="" loading="lazy" />
-                  </button>
-                ))}
-              </div>
+          {hasBody ? (
+            <div className="article-body">
+              {article.body.map((block, i) => (
+                <BodyBlockView
+                  key={i}
+                  block={block}
+                  index={i}
+                  node={article.node}
+                  path={path}
+                />
+              ))}
             </div>
-          ) : null}
+          ) : (
+            <>
+              {article.description ? (
+                <p className="article-desc">{article.description}</p>
+              ) : null}
+              {videoSource(article.video) ? (
+                <Player
+                  key={`${article.node}${path}`}
+                  source={videoSource(article.video)!}
+                />
+              ) : (
+                <p className="status">该文章没有可解析的视频。</p>
+              )}
+              {article.images.length ? (
+                <div className="gallery">
+                  {article.images.map((img, i) => (
+                    <figure className="article-figure" key={i}>
+                      <img src={img} alt="" loading="lazy" />
+                    </figure>
+                  ))}
+                </div>
+              ) : null}
+            </>
+          )}
         </>
       ) : null}
     </section>
