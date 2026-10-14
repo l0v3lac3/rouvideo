@@ -403,29 +403,79 @@ function stripTags(html: string): string {
 }
 
 /**
- * Extract the inner HTML of `<div class="post-content" itemprop="articleBody">`
- * (the real ordered body). Returns "" if the page has no such block.
+ * Extract the real article body: the inner HTML of
+ * `<div class="post-content" itemprop="articleBody">`. The site's markup has
+ * unbalanced divs (and the whole trailing boilerplate — 版权 / 重磅热瓜 /
+ * 最新地址 / 下载APP — lives *after* the body's prev/next nav), so a naive
+ * div-balance walk over-captures. The reliable end marker is the first
+ * `<div class="post-near"` (上一篇/下一篇 nav) after the body open; fallback to
+ * `</article>`. Verified across 68 articles.
  */
 function extractArticleBody(html: string): string {
   const startTag = '<div class="post-content" itemprop="articleBody">';
   const start = html.indexOf(startTag);
   if (start < 0) return "";
-  let pos = html.indexOf(">", start) + 1; // just inside the opening tag
-  let depth = 1;
-  while (pos < html.length) {
-    const nextOpen = html.indexOf("<div", pos);
-    const nextClose = html.indexOf("</div>", pos);
-    if (nextClose === -1) break;
-    if (nextOpen !== -1 && nextOpen < nextClose) {
-      depth++;
-      pos = nextOpen + 4;
-    } else {
-      depth--;
-      pos = nextClose + 6;
-      if (depth === 0) break;
+  const openEnd = html.indexOf(">", start) + 1;
+  const near = html.indexOf('<div class="post-near"', start);
+  const article = html.indexOf("</article>", start);
+  let end: number;
+  if (near > start) end = near;
+  else if (article > start) end = article;
+  else {
+    // Fallback: div-balance from the opening tag.
+    let pos = openEnd;
+    let depth = 1;
+    while (pos < html.length) {
+      const no = html.indexOf("<div", pos);
+      const nc = html.indexOf("</div>", pos);
+      if (nc === -1) break;
+      if (no !== -1 && no < nc) {
+        depth++;
+        pos = no + 4;
+      } else {
+        depth--;
+        pos = nc + 6;
+        if (depth === 0) break;
+      }
     }
+    end = pos;
   }
-  return html.slice(html.indexOf(">", start) + 1, pos);
+  return html.slice(openEnd, end);
+}
+
+/**
+ * True for the site's own boilerplate blocks that are not article content:
+ *  - the site-nav quote box ("🔗 51吃瓜最新地址 … 国内/海外/永久/交流群/播放异常")
+ *  - the in-body hashtag list paragraph ("关键词：#… #…")
+ *  - the category-nav heading ("🔥 热门吃瓜")
+ * Tags are already sourced from the authoritative `data-video_tag_name`, so the
+ * in-body 关键词 hashtag list is redundant and dropped.
+ */
+function isBodyBoilerplate(kind: "p" | "quote", text: string): boolean {
+  if (kind === "quote") {
+    const nav =
+      text.includes("51吃瓜最新地址") ||
+      text.includes("播放异常") ||
+      (text.includes("国内") && text.includes("海外")) ||
+      text.includes("官方QQ群") ||
+      text.includes("官方微信QQ群");
+    return nav;
+  }
+  // kind === "p"
+  const trimmed = text.trim();
+  return (
+    trimmed.startsWith("关键词") ||
+    trimmed.includes("热门吃瓜") ||
+    trimmed.includes("该文章由") ||
+    trimmed.includes("版权声明") ||
+    trimmed.includes("下载APP观看完整版") ||
+    trimmed.includes("分享好友吃瓜") ||
+    // 51吃瓜轻量版 skin puts these site-nav lines as <p> inside the body.
+    trimmed.includes("邮件至官方邮箱") ||
+    trimmed.includes("TG讨论") ||
+    trimmed.includes("telegram.me") ||
+    trimmed.includes("重要提示")
+  );
 }
 
 /**
@@ -460,7 +510,7 @@ export function parseArticleBody(bodyHtml: string): Cg51BodyBlock[] {
       if (text) blocks.push({ type: "h", level: Number(m[1]), text });
     } else if (m[0].startsWith("<blockquote")) {
       const text = stripTags(m[0]);
-      if (text) blocks.push({ type: "quote", text });
+      if (text && !isBodyBoilerplate("quote", text)) blocks.push({ type: "quote", text });
     } else if (m[3] !== undefined) {
       const inner = m[3];
       const vidMatch = inner.match(/class="dplayer"([^>]*)/);
@@ -473,8 +523,10 @@ export function parseArticleBody(bodyHtml: string): Cg51BodyBlock[] {
       const imgSrc = inner.match(/data-xkrkllgl="([^"]+)"/)?.[1] ??
         inner.match(/<img[^>]+src="(https:[^"]+)"/)?.[1];
       // Push text and image separately (both, in order) so a mixed paragraph
-      // is preserved; image-only paragraphs yield just an img block.
-      if (text) blocks.push({ type: "p", text });
+      // is preserved; image-only paragraphs yield just an img block. The
+      // in-body 关键词 hashtag list is dropped (tags already come from
+      // data-video_tag_name).
+      if (text && !isBodyBoilerplate("p", text)) blocks.push({ type: "p", text });
       if (imgSrc) blocks.push({ type: "img", url: imgSrc });
     }
   }
