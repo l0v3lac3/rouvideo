@@ -296,7 +296,9 @@ async function signArticleImages(
   const body = [];
   for (const b of article.body) {
     if (b.type === "img") body.push({ ...b, url: await signImgUrl(secret, origin, b.url) });
-    else body.push(b);
+    else if (b.type === "rec") {
+      body.push({ ...b, rec: { ...b.rec, cover: await signImgUrl(secret, origin, b.rec.cover) } });
+    } else body.push(b);
   }
   const recommendations = [];
   for (const r of article.recommendations) {
