@@ -1,12 +1,17 @@
 import { useEffect, useState } from 'react';
 import { Player, type StreamSource } from './Player';
-import { getArticle, type Cg51Article, type Cg51BodyBlock } from '../lib/api';
+import {
+  getArticle,
+  type Cg51Article,
+  type Cg51BodyBlock,
+  type Cg51Rec,
+} from '../lib/api';
 
 /**
  * Article detail in the original site's layout: metadata up top, then the
- * ordered body (paragraphs, headings, images and videos interleaved exactly
- * as on 51吃瓜). Station promo posts (isPromo) render their text but no
- * player.
+ * ordered body (paragraphs, headings, images, videos and recommendation
+ * entries interleaved exactly as on 51吃瓜). Station promo posts (isPromo)
+ * render their text but no player.
  *
  * The video source for a `video` block is derived from the parsed article:
  *  - `video.type === 'hls'` → hls.js against the m3u8 directly
@@ -22,16 +27,42 @@ function videoSource(v: Cg51Article['video']): StreamSource | null {
     : null;
 }
 
+function RecCard({
+  rec,
+  onOpen,
+}: {
+  rec: Cg51Rec;
+  onOpen: (p: string) => void;
+}) {
+  return (
+    <button
+      className="rec-card"
+      onClick={() => onOpen(rec.path)}
+      title={rec.title}
+    >
+      {rec.cover ? (
+        <img className="rec-cover" src={rec.cover} alt="" loading="lazy" />
+      ) : null}
+      <span className="rec-text">
+        <span className="rec-title">{rec.title}</span>
+        {rec.desc ? <span className="rec-desc">{rec.desc}</span> : null}
+      </span>
+    </button>
+  );
+}
+
 function BodyBlockView({
   block,
   index,
   node,
   path,
+  onOpen,
 }: {
   block: Cg51BodyBlock;
   index: number;
   node: string;
   path: string;
+  onOpen: (p: string) => void;
 }) {
   switch (block.type) {
     case 'h': {
@@ -56,12 +87,22 @@ function BodyBlockView({
         />
       );
     }
+    case 'rec':
+      return <RecCard rec={block.rec} onOpen={onOpen} />;
     case 'p':
       return <p className="article-p">{block.text}</p>;
   }
 }
 
-export function Article({ path, node }: { path: string; node: string }) {
+export function Article({
+  path,
+  node,
+  onOpenPath,
+}: {
+  path: string;
+  node: string;
+  onOpenPath: (path: string) => void;
+}) {
   const [article, setArticle] = useState<Cg51Article | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -139,6 +180,7 @@ export function Article({ path, node }: { path: string; node: string }) {
                   index={i}
                   node={article.node}
                   path={path}
+                  onOpen={onOpenPath}
                 />
               ))}
             </div>

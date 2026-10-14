@@ -119,12 +119,24 @@ export type FeedResult = {
   items: FeedItem[];
 };
 
+export type Cg51Rec = {
+  /** Title of the recommended article. */
+  title: string;
+  /** /archives/<id>/ path on the same node (relative, starts with /). */
+  path: string;
+  /** Cover image URL (may be empty). */
+  cover: string;
+  /** Short description (collection TOC entries carry 简要描述). */
+  desc: string;
+};
+
 export type Cg51BodyBlock =
   | { type: 'p'; text: string }
   | { type: 'h'; level: number; text: string }
   | { type: 'img'; url: string }
   | { type: 'video'; video: Cg51Video }
-  | { type: 'quote'; text: string };
+  | { type: 'quote'; text: string }
+  | { type: 'rec'; rec: Cg51Rec };
 
 export type Cg51Article = {
   node: string;
@@ -140,6 +152,8 @@ export type Cg51Article = {
   images: string[];
   /** Ordered body in original site layout (text/heading/image/video/quote). */
   body: Cg51BodyBlock[];
+  /** Recommendation ("推介") entries — clickable, jump to the linked article. */
+  recommendations: Cg51Rec[];
   video: Cg51Video | null;
   /** Station promo/ad article (Meme/招募/抽奖) — no playable video. */
   isPromo: boolean;

@@ -298,7 +298,11 @@ async function signArticleImages(
     if (b.type === "img") body.push({ ...b, url: await signImgUrl(secret, origin, b.url) });
     else body.push(b);
   }
-  return { ...article, cover, images, body };
+  const recommendations = [];
+  for (const r of article.recommendations) {
+    recommendations.push({ ...r, cover: await signImgUrl(secret, origin, r.cover) });
+  }
+  return { ...article, cover, images, body, recommendations };
 }
 
 // List feed items for the home page or a category page.

@@ -568,6 +568,60 @@ code {
   border-radius: 999px;
 }
 
+/* Recommendation (推介) cards — click to open the linked article. */
+.rec-card {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(127, 127, 127, 0.06);
+  cursor: pointer;
+  text-align: left;
+  color: var(--text);
+  font-size: 0.9rem;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
+}
+
+.rec-card:hover {
+  border-color: var(--accent);
+  background: rgba(127, 127, 127, 0.12);
+}
+
+.rec-cover {
+  width: 92px;
+  height: 58px;
+  flex: none;
+  object-fit: cover;
+  border-radius: 6px;
+  background: #000;
+}
+
+.rec-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.rec-title {
+  font-weight: 500;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.rec-desc {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
 /* ------------------------------------------------------------------ *
  * Back button
  * ------------------------------------------------------------------ */

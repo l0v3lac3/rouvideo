@@ -136,7 +136,11 @@ export default function App() {
                   <Feed path={feedPath} node={node} onOpen={openArticle} />
                 </>
               ) : (
-                <Article path={articlePath} node={node} />
+                <Article
+                  path={articlePath}
+                  node={node}
+                  onOpenPath={(p) => setArticlePath(p)}
+                />
               )}
               {articlePath ? (
                 <button

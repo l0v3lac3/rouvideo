@@ -334,12 +334,24 @@ export type Cg51Video = {
   id: string;
 };
 
+export type Cg51Rec = {
+  /** Title of the recommended article. */
+  title: string;
+  /** /archives/<id>/ path on the same node (relative, starts with /). */
+  path: string;
+  /** Cover image URL (may be empty). */
+  cover: string;
+  /** Short description (collection TOC entries carry 简要描述). */
+  desc: string;
+};
+
 export type Cg51BodyBlock =
   | { type: "p"; text: string }
   | { type: "h"; level: number; text: string }
   | { type: "img"; url: string }
   | { type: "video"; video: Cg51Video }
-  | { type: "quote"; text: string };
+  | { type: "quote"; text: string }
+  | { type: "rec"; rec: Cg51Rec };
 
 export type Cg51Article = {
   node: string;
@@ -355,6 +367,8 @@ export type Cg51Article = {
   images: string[];
   /** Ordered body as it appears on the original site (text/heading/image/video). */
   body: Cg51BodyBlock[];
+  /** Recommendation ("推介") entries — site-specific, in order. */
+  recommendations: Cg51Rec[];
   video: Cg51Video | null;
   /** True when this is a station promo/ad article (no playable video). */
   isPromo: boolean;
@@ -495,16 +509,27 @@ function extractVideoFromDplayer(attrs: string): Cg51Video | null {
 
 /**
  * Parse the ordered articleBody HTML into blocks in original site order:
- * paragraphs, headings, images, in-body videos and quote boxes. The station
- * gambling `txt-apps` row, `line` dividers and `menu_index` anchors are dropped
- * as they are site chrome/ads, not article content.
+ * paragraphs, headings, images, in-body videos, quote boxes and recommendation
+ * ("推介") entries. The station gambling `txt-apps` row, `line` dividers and
+ * `menu_index` anchors are dropped as they are site chrome/ads, not content.
+ *
+ * Recommendations are identified by the site-specific
+ * `<a class="btn btn-primary" href="/archives/<id>/">` link (never used for
+ * normal content links). Two formats:
+ *  - single: `<p><img 封面><br><a class="btn btn-primary">标题 点击观看</a></p>`
+ *  - collection TOC: `<p><a class="btn btn-primary">标题 点击查看详情</a></p>`
+ *    followed by `<p><a href=同id><img 封面></a> 简要描述：…</p>` + `<hr>`
  */
 export function parseArticleBody(bodyHtml: string): Cg51BodyBlock[] {
   const blocks: Cg51BodyBlock[] = [];
   const BLOCK_RE =
     /<h([23])[^>]*>([\s\S]*?)<\/h[23]>|<blockquote[\s\S]*?<\/blockquote>|<p[^>]*>([\s\S]*?)<\/p>/g;
+  const REC_LINK_RE =
+    new RegExp('<a href="(/archives/\\d+/)"[^>]*class="btn btn-primary"[^>]*>([\\s\\S]*?)</a>');
+  let skipUntil = -1;
   let m: RegExpExecArray | null;
   while ((m = BLOCK_RE.exec(bodyHtml))) {
+    if (m.index < skipUntil) continue;
     if (m[1]) {
       const text = stripTags(m[2]);
       if (text) blocks.push({ type: "h", level: Number(m[1]), text });
@@ -517,6 +542,42 @@ export function parseArticleBody(bodyHtml: string): Cg51BodyBlock[] {
       const video = vidMatch ? extractVideoFromDplayer(vidMatch[1]) : null;
       if (video) {
         blocks.push({ type: "video", video });
+        continue;
+      }
+      // Recommendation entry? (site-unique btn-primary link to another article)
+      const recLink = inner.match(REC_LINK_RE);
+      if (recLink) {
+        const path = recLink[1];
+        const title = stripTags(recLink[2]);
+        let cover = inner.match(/data-xkrkllgl="([^"]+)"/)?.[1] ?? "";
+        let desc = "";
+        if (!cover) {
+          // Collection format: the cover + 简要描述 live in the NEXT <p>.
+          // Note: the site sometimes points the cover's <a> at the WRONG id
+          // (e.g. every cover links to a single 合集 entry). Only treat it as
+          // this rec's cover if the wrapped img belongs to a rec cover AND the
+          // id matches; otherwise let the next <p> be parsed normally (img +
+          // desc blocks).
+          const restStart = m.index + m[0].length;
+          const rest = bodyHtml.slice(restStart);
+          const nextP = rest.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+          if (nextP && nextP[1].includes(`href="${path}"`)) {
+            const imgUrl = nextP[1].match(/data-xkrkllgl="([^"]+)"/)?.[1] ?? "";
+            if (imgUrl) {
+              // The wrapped img is the rec's cover (id-matched). Skip the whole
+              // <p> so its 简要描述 text isn't duplicated.
+              if (nextP[1].includes(`<a href="${path}"><img`)) {
+                cover = imgUrl;
+                desc = (nextP[1].match(/简要描述：<\/strong>\s*([^<]+)/)?.[1] ?? "").trim();
+                skipUntil = restStart + (nextP.index ?? 0) + nextP[0].length;
+              } else {
+                // id mismatch: let the parser emit img + desc separately.
+                cover = "";
+              }
+            }
+          }
+        }
+        if (title) blocks.push({ type: "rec", rec: { title, path, cover, desc } });
         continue;
       }
       const text = stripTags(inner);
@@ -584,12 +645,23 @@ export function parseArticle(html: string, node: string, path: string): Cg51Arti
   const tags = tagSource.split(",").map(t => t.trim()).filter(Boolean);
 
   // Flat image list = every image block, in order (kept for the gallery).
-  const images = body.filter(b => b.type === "img").map(b => (b as { url: string }).url);
+  // Recommendation covers are NOT the article's own photos — they're covers of
+  // the linked-to articles — so exclude them.
+  const recs = body
+    .filter(b => b.type === "rec")
+    .map(b => (b as { rec: Cg51Rec }).rec);
+  const recCovers = new Set(recs.map(r => r.cover).filter(Boolean));
+  const images = body
+    .filter(b => b.type === "img")
+    .map(b => (b as { url: string }).url)
+    .filter(u => !recCovers.has(u));
   const cover = images[0] ?? "";
 
-  // A legit article always embeds a playable video; station promo posts
-  // (Meme coin, 招募, 抽奖) never do. Verified across 47 articles, 2026-10-14.
-  const isPromo = video === null;
+  // Station promo posts (Meme coin, 招募, 抽奖) never embed a video AND have
+  // at most one (self-cross-linking) recommendation. Collections (合集) also
+  // have no video but carry a table-of-contents of many recommendations.
+  // Verified across 70+ articles, 2026-10-14.
+  const isPromo = video === null && recs.length < 2;
 
   return {
     node: base,
@@ -604,6 +676,7 @@ export function parseArticle(html: string, node: string, path: string): Cg51Arti
     cover,
     images,
     body,
+    recommendations: recs,
     video,
     isPromo,
   };
