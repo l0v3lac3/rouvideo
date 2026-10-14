@@ -78,3 +78,101 @@ export function isRouPageUrl(value: string): boolean {
     return false;
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * 51吃瓜 (cg51.com) source — node discovery, feeds, articles.
+ * ------------------------------------------------------------------ */
+
+export type Cg51Video = {
+  url: string;
+  type: string;
+  id: string;
+};
+
+export type Cg51Category = { slug: string; name: string };
+
+export type NodeInfo = {
+  node: string;
+  source: 'api' | 'default';
+  main: string | null;
+  domains: string[];
+  landing: string;
+  categories: Cg51Category[];
+};
+
+export type FeedItem = {
+  id: string;
+  url: string;
+  title: string;
+  cover: string;
+  published: string;
+  author: string;
+  categories: string[];
+  views: string;
+};
+
+export type FeedResult = {
+  node: string;
+  path: string;
+  page: number;
+  totalPages: number;
+  items: FeedItem[];
+};
+
+export type Cg51Article = {
+  node: string;
+  url: string;
+  title: string;
+  description: string;
+  author: string;
+  published: string;
+  modified: string;
+  categories: string[];
+  tags: string[];
+  cover: string;
+  images: string[];
+  video: Cg51Video | null;
+};
+
+async function getJson<T>(path: string): Promise<T> {
+  if (!API_BASE) {
+    throw new ApiError(
+      'VITE_CONVEX_SITE_URL 未配置：请把 Convex 部署的 .convex.site 地址写入环境变量后重新构建',
+    );
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`);
+  } catch (error) {
+    throw new ApiError(
+      `无法连接后端：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  const body: { error?: string } & T = await res.json().catch(() => ({}) as T);
+  if (!res.ok)
+    throw new ApiError(body.error ?? `请求失败（HTTP ${res.status}）`);
+  return body;
+}
+
+/** Discover the current content node and its category nav. */
+export function getNodeInfo(): Promise<NodeInfo> {
+  return getJson<NodeInfo>('/api/node');
+}
+
+/** List a feed page (home or category). */
+export function getFeed(
+  path: string,
+  page: number,
+  node?: string,
+): Promise<FeedResult> {
+  const q = new URLSearchParams({ path, page: String(page) });
+  if (node) q.set('node', node);
+  return getJson<FeedResult>(`/api/feed?${q}`);
+}
+
+/** Resolve an article page into full metadata + media. */
+export function getArticle(path: string, node?: string): Promise<Cg51Article> {
+  const q = new URLSearchParams({ path });
+  if (node) q.set('node', node);
+  return getJson<Cg51Article>(`/api/article?${q}`);
+}

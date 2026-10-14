@@ -2,6 +2,15 @@ import type Hls from 'hls.js';
 import { useEffect, useRef, useState } from 'react';
 import { resolveStream, type StreamInfo } from '../lib/api';
 
+/**
+ * What the player should show. Either a rou.video page (resolved through the
+ * Convex proxy) or a direct stream URL (the cg51 nodes serve CORS-open HLS /
+ * MP4 that the browser can play without a proxy).
+ */
+export type StreamSource =
+  | { kind: 'rou'; pageUrl: string }
+  | { kind: 'url'; url: string; type: 'hls' | 'mp4' };
+
 type Status = {
   kind: 'idle' | 'busy' | 'ready' | 'error';
   message: string;
@@ -9,29 +18,31 @@ type Status = {
 
 const IDLE_STATUS: Status = {
   kind: 'idle',
-  message: '就绪。粘贴 rou.video 视频页链接后点击播放。',
+  message: '就绪。选择或粘贴一个视频后点击播放。',
 };
 
 /**
- * HLS player.
+ * Unified video player.
  *
- * The playlist URL it loads has already been rewritten by the Convex backend to
- * point at /api/media, so every playlist and segment request goes through the
- * proxy — which is what makes playback possible at all (the origin sends no CORS
- * headers and wraps its payload in a PNG container).
+ * - For `kind: 'rou'` it calls the Convex `/api/resolve` proxy (which unwraps
+ *   the PNG container and rewrites the HLS playlist) and feeds hls.js.
+ * - For `kind: 'url'` with `type: 'hls'` it points hls.js straight at the
+ *   upstream m3u8 (the node and its CDN both send `Access-Control-Allow-Origin:
+ *   *`, so no proxy is needed).
+ * - For `kind: 'url'` with `type: 'mp4'` it sets `video.src` directly.
  *
- * Mount it with `key={pageUrl}` so switching videos resets the player state.
+ * Mount it with `key={...}` so switching sources resets the player state.
  */
-export function Player({ pageUrl }: { pageUrl: string | null }) {
+export function Player({ source }: { source: StreamSource | null }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [status, setStatus] = useState<Status>(() =>
-    pageUrl ? { kind: 'busy', message: '正在解密视频地址…' } : IDLE_STATUS,
+    source ? { kind: 'busy', message: '正在加载视频…' } : IDLE_STATUS,
   );
   const [stream, setStream] = useState<StreamInfo | null>(null);
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!pageUrl || !video) return;
+    if (!source || !video) return;
 
     let cancelled = false;
     let hls: Hls | null = null;
@@ -41,6 +52,8 @@ export function Player({ pageUrl }: { pageUrl: string | null }) {
         hls.destroy();
         hls = null;
       }
+      video.removeAttribute('src');
+      video.load();
     };
 
     const play = () => {
@@ -49,65 +62,86 @@ export function Player({ pageUrl }: { pageUrl: string | null }) {
       });
     };
 
-    const run = async () => {
-      let info: StreamInfo;
-      try {
-        info = await resolveStream(pageUrl);
-      } catch (error) {
-        if (!cancelled) {
-          setStatus({
-            kind: 'error',
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
-        return;
-      }
-      if (cancelled) return;
-      setStream(info);
+    const mountHls = (playlistUrl: string, upstreamUrl: string) => {
+      setStream({
+        videoUrl: upstreamUrl,
+        playlistUrl,
+        thumbVttUrl: null,
+      });
       setStatus({ kind: 'busy', message: '正在加载视频流…' });
+      void import('hls.js').then((HlsLib) => {
+        if (cancelled) return;
+        const { default: Hls } = HlsLib;
+        if (Hls.isSupported()) {
+          const instance = new Hls();
+          hls = instance;
+          (window as Window & { __hls?: Hls }).__hls = instance;
+          instance.loadSource(playlistUrl);
+          instance.attachMedia(video);
+          instance.on(Hls.Events.MANIFEST_PARSED, () => {
+            if (cancelled) return;
+            setStatus({ kind: 'ready', message: '播放就绪' });
+            play();
+          });
+          instance.on(Hls.Events.ERROR, (_event, data) => {
+            if (cancelled) return;
+            setStatus({
+              kind: 'error',
+              message: `${data.type}: ${data.details}`,
+            });
+            if (!data.fatal) return;
+            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+              instance.startLoad();
+            } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+              instance.recoverMediaError();
+            } else {
+              destroy();
+            }
+          });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+          video.src = playlistUrl;
+          video.addEventListener(
+            'loadedmetadata',
+            () => {
+              if (cancelled) return;
+              setStatus({ kind: 'ready', message: '播放就绪' });
+              play();
+            },
+            { once: true },
+          );
+        } else {
+          setStatus({ kind: 'error', message: '此浏览器不支持 HLS 播放' });
+        }
+      });
+    };
 
-      // hls.js is ~500 kB minified, so it is loaded only when a video is actually
-      // requested instead of shipping on first paint.
-      const { default: HlsLib } = await import('hls.js');
-      if (cancelled) return;
-
-      if (HlsLib.isSupported()) {
-        const instance = new HlsLib();
-        hls = instance;
-        // Exposed for debugging from the browser console (the original script did
-        // the same with window.__hls).
-        (window as Window & { __hls?: Hls }).__hls = instance;
-        if (cancelled) {
-          destroy();
+    const run = async () => {
+      if (source.kind === 'rou') {
+        setStatus({ kind: 'busy', message: '正在解密视频地址…' });
+        let info: StreamInfo;
+        try {
+          info = await resolveStream(source.pageUrl);
+        } catch (error) {
+          if (!cancelled) {
+            setStatus({
+              kind: 'error',
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
           return;
         }
-        instance.loadSource(info.playlistUrl);
-        instance.attachMedia(video);
-
-        instance.on(HlsLib.Events.MANIFEST_PARSED, () => {
-          if (cancelled) return;
-          setStatus({ kind: 'ready', message: '播放就绪' });
-          play();
+        if (cancelled) return;
+        mountHls(info.playlistUrl, info.videoUrl);
+      } else if (source.type === 'hls') {
+        mountHls(source.url, source.url);
+      } else {
+        // mp4 (or other progressive format) — play directly.
+        setStream({
+          videoUrl: source.url,
+          playlistUrl: source.url,
+          thumbVttUrl: null,
         });
-
-        instance.on(HlsLib.Events.ERROR, (_event, data) => {
-          if (cancelled) return;
-          setStatus({
-            kind: 'error',
-            message: `${data.type}: ${data.details}`,
-          });
-          if (!data.fatal) return;
-          if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR) {
-            instance.startLoad();
-          } else if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR) {
-            instance.recoverMediaError();
-          } else {
-            destroy();
-          }
-        });
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Safari plays HLS natively.
-        video.src = info.playlistUrl;
+        video.src = source.url;
         video.addEventListener(
           'loadedmetadata',
           () => {
@@ -117,8 +151,6 @@ export function Player({ pageUrl }: { pageUrl: string | null }) {
           },
           { once: true },
         );
-      } else {
-        setStatus({ kind: 'error', message: '此浏览器不支持 HLS 播放' });
       }
     };
 
@@ -128,7 +160,7 @@ export function Player({ pageUrl }: { pageUrl: string | null }) {
       cancelled = true;
       destroy();
     };
-  }, [pageUrl]);
+  }, [source]);
 
   return (
     <div className="player">
@@ -143,8 +175,12 @@ export function Player({ pageUrl }: { pageUrl: string | null }) {
         <dl className="details">
           <dt>上游视频流</dt>
           <dd>{stream.videoUrl}</dd>
-          <dt>经代理的播放列表</dt>
-          <dd>{stream.playlistUrl}</dd>
+          {stream.videoUrl !== stream.playlistUrl ? (
+            <>
+              <dt>播放列表</dt>
+              <dd>{stream.playlistUrl}</dd>
+            </>
+          ) : null}
         </dl>
       ) : null}
     </div>

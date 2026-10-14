@@ -27,6 +27,17 @@ import {
   unwrapPng,
   b64urlDecode,
 } from "./rou";
+import {
+  assertArchivePath,
+  buildFeedPath,
+  fetchNodeText,
+  getNodeForRequest,
+  parseArticle,
+  parseCategories,
+  parseFeed,
+  refreshNode,
+  CG51_LANDING,
+} from "./cg51";
 import { unzlibSync, zlibSync } from "fflate";
 
 const CORS: Record<string, string> = {
@@ -205,6 +216,67 @@ http.route({
   pathPrefix: "/api/",
   method: "OPTIONS",
   handler: httpAction(async () => new Response(null, { status: 204, headers: CORS })),
+});
+
+// ------------------------------------------------------------------
+// 51吃瓜 (cg51.com) source — node discovery, feed browsing, articles.
+// These power the "news → video" side of the merged video-parsing site.
+// ------------------------------------------------------------------
+
+// Discover the current content node by decrypting the cg51.com landing config,
+// and return the category nav so the UI can build the sidebar.
+http.route({
+  path: "/api/node",
+  method: "GET",
+  handler: httpAction(async () => {
+    try {
+      const info = await refreshNode();
+      const home = await fetchNodeText("/");
+      const categories = parseCategories(home);
+      return json({ ...info, landing: CG51_LANDING, categories });
+    } catch (error) {
+      return fail(error);
+    }
+  }),
+});
+
+// List feed items for the home page or a category page.
+// ?path=/ (or /category/<slug>)  ?page=N  ?node=<override>
+http.route({
+  path: "/api/feed",
+  method: "GET",
+  handler: httpAction(async (_ctx: ActionCtx, req: Request) => {
+    try {
+      const params = new URL(req.url).searchParams;
+      const nodeOverride = params.get("node") || undefined;
+      const pathRaw = params.get("path") || "/";
+      const page = Number(params.get("page") || "1");
+      const base = await getNodeForRequest(nodeOverride);
+      const feedPath = buildFeedPath(pathRaw, page);
+      const html = await fetchNodeText(feedPath, base);
+      return json(parseFeed(html, base, feedPath, page));
+    } catch (error) {
+      return fail(error);
+    }
+  }),
+});
+
+// Resolve an article page into full metadata + media list.
+// ?path=/archives/<id>/  ?node=<override>
+http.route({
+  path: "/api/article",
+  method: "GET",
+  handler: httpAction(async (_ctx: ActionCtx, req: Request) => {
+    try {
+      const params = new URL(req.url).searchParams;
+      const path = assertArchivePath(params.get("path") || "");
+      const base = await getNodeForRequest(params.get("node") || undefined);
+      const html = await fetchNodeText(path, base);
+      return json(parseArticle(html, base, path));
+    } catch (error) {
+      return fail(error);
+    }
+  }),
 });
 
 export default http;

@@ -8,6 +8,7 @@
  * @module
  */
 
+import type * as cg51 from "../cg51.js";
 import type * as http from "../http.js";
 import type * as rou from "../rou.js";
 
@@ -18,6 +19,7 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  cg51: typeof cg51;
   http: typeof http;
   rou: typeof rou;
 }>;
